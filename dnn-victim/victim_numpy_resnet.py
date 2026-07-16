@@ -1,6 +1,8 @@
 import time
 import ctypes
 import numpy as np
+import mmap
+import ctypes
 
 np.random.seed(2)
 gpa = ctypes.CDLL("./libgpa_helper.so")
@@ -13,15 +15,10 @@ def print_gpa(name, arr):
     print(f"{name} GPA: 0x{phys:x}", flush=True)
 
 _marker_keepalive = []
-
-_marker_counter = 0
-
 def make_marker():
     marker = np.zeros(8 * 1024 * 1024, dtype=np.uint8)
-
     offset = 4 * 1024 * 1024
     marker[offset] = 1
-
     _marker_keepalive.append(marker)
     return marker[offset:]
 
