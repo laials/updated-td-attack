@@ -14,24 +14,12 @@ def print_gpa(name, arr):
     print(f"{name} GPA: 0x{phys:x}", flush=True)
 
 _marker_keepalive = []
-
-_marker_keepalive = []
-_marker_count = [0]
-
 def make_marker():
-    # Allocate 4MB, touch at a unique 2MB-aligned offset per marker
-    # Each marker gets its own 4MB array so they land on different 2MB pages
-    size = 4 * 1024 * 1024
-    marker = np.zeros(size, dtype=np.uint8)
-    # Force a unique physical page by writing to different offsets
-    # and keeping all arrays alive
-    marker[0] = _marker_count[0] + 1
-    _marker_count[0] += 1
+    marker = np.zeros(64 * 1024 * 1024, dtype=np.uint8)
+    offset = 4 * 1024 * 1024
+    marker[offset] = 1
     _marker_keepalive.append(marker)
-    # Touch the middle to ensure physical allocation
-    mid = size // 2
-    marker[mid] = 1
-    return marker[mid:]
+    return marker[offset:]
 
 def touch_marker(marker):
     marker[0] ^= 1
