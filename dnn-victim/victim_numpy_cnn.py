@@ -14,9 +14,15 @@ def print_gpa(name, arr):
     print(f"{name} GPA: 0x{phys:x}", flush=True)
 
 _marker_keepalive = []
+
 def make_marker():
-    marker = np.zeros(64 * 1024 * 1024, dtype=np.uint8)
-    offset = 4 * 1024 * 1024
+    # Burn 3MB of physical pages to push next allocation past 2MB boundary
+    dummy = np.zeros(3 * 1024 * 1024, dtype=np.uint8)
+    dummy[:] = 1  # force physical allocation of all pages
+    _marker_keepalive.append(dummy)
+    
+    marker = np.zeros(4 * 1024 * 1024, dtype=np.uint8)
+    offset = 2 * 1024 * 1024
     marker[offset] = 1
     _marker_keepalive.append(marker)
     return marker[offset:]
