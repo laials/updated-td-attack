@@ -17,9 +17,8 @@ _marker_keepalive = []
 
 _marker_index = [0]
 def make_marker():
-    marker = np.zeros(16 * 1024 * 1024, dtype=np.uint8)
-    offset = 4 * 1024 * 1024 + (_marker_index[0] * 2 * 1024 * 1024)
-    _marker_index[0] += 1
+    marker = np.zeros(32 * 1024 * 1024, dtype=np.uint8)
+    offset = 4 * 1024 * 1024
     marker[offset] = 1
     _marker_keepalive.append(marker)
     return marker[offset:]
